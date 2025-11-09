@@ -1,11 +1,11 @@
-CC = gcc
-CFLAGS = -Wall -O2
+CXX = g++
+CXXFLAGS = -Wall -O2
 TARGET = client
 
 all: $(TARGET)
 
-$(TARGET): client.c
-	$(CC) $(CFLAGS) -o $(TARGET) client.c
+$(TARGET): client.cpp
+	$(CXX) $(CXXFLAGS) -o $(TARGET) client.cpp
 
 clean:
 	rm -f $(TARGET)
