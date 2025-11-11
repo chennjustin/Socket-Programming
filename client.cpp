@@ -39,6 +39,13 @@ string recv_once(int fd) {
     return string(buf);
 }
 
+bool talk_to_server(const string &msg, string &response) {
+    lock_guard<mutex> lk(io_mtx);
+    if (!send_all(server_sock, msg)) return false;
+    response = recv_once(server_sock);
+    return !response.empty();
+}
+
 string trim(const string &s) {
     size_t i = s.find_first_not_of(" \t\r\n");
     if (i == string::npos) return "";
@@ -50,18 +57,29 @@ string trim(const string &s) {
 bool find_user_in_list(const string &list, const string &user, string &ip, string &port) {
     istringstream iss(list);
     string line;
-    // 跳過前三行：餘額、公鑰、上線人數
+
+    // 跳過前三行 (餘額、公鑰、上線人數)
     getline(iss, line);
     getline(iss, line);
     getline(iss, line);
+
     while (getline(iss, line)) {
-        // 格式：user#ip#port
-        if (line.rfind(user + "#", 0) == 0) {
-            size_t p1 = line.find('#', user.size() + 1);
-            if (p1 == string::npos) return false;
-            size_t p2 = line.find('#', p1 + 1);
-            ip = line.substr(p1 + 1, p2 - (p1 + 1));
-            port = line.substr(p2 + 1);
+        line = trim(line); // 去除尾端 \r 或空白
+        if (line.empty()) continue;
+
+        // line 例如：cc#127.0.0.1#4444
+        string uname, uip, uport;
+        size_t p1 = line.find('#');
+        size_t p2 = line.find('#', p1 + 1);
+        if (p1 == string::npos || p2 == string::npos) continue;
+
+        uname = line.substr(0, p1);
+        uip   = line.substr(p1 + 1, p2 - p1 - 1);
+        uport = line.substr(p2 + 1);
+
+        if (uname == user) {
+            ip = uip;
+            port = uport;
             return true;
         }
     }
@@ -70,6 +88,7 @@ bool find_user_in_list(const string &list, const string &user, string &ip, strin
 
 // ------------------------ P2P 收款監聽 ------------------------
 // 注意：不要在這個 thread 裡印「正在監聽…」；由主線在登入成功後印一次即可。
+// ------------------------ P2P 收款監聽 ------------------------
 void listener_thread_fn(int port) {
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     if (ls < 0) return;
@@ -91,20 +110,18 @@ void listener_thread_fn(int port) {
         int cs = accept(ls, (sockaddr *)&caddr, &clen);
         if (cs < 0) continue;
 
-        // 每筆轉帳開一個小工作
+        // 每筆轉帳開一個獨立執行緒
         thread([cs]() {
             string msg = recv_once(cs);         // 期待格式：A#amount#B
             if (msg.empty()) { close(cs); return; }
 
-            string sender, amount_str, receiver;
-            {   // 解析 A#amount#B
-                size_t h1 = msg.find('#');
-                size_t h2 = msg.find('#', h1 + 1);
-                if (h1 == string::npos || h2 == string::npos) { close(cs); return; }
-                sender = msg.substr(0, h1);
-                amount_str = msg.substr(h1 + 1, h2 - h1 - 1);
-                receiver = msg.substr(h2 + 1);
-            }
+            size_t h1 = msg.find('#');
+            size_t h2 = msg.find('#', h1 + 1);
+            if (h1 == string::npos || h2 == string::npos) { close(cs); return; }
+
+            string sender = msg.substr(0, h1);
+            string amount_str = msg.substr(h1 + 1, h2 - h1 - 1);
+            string receiver = msg.substr(h2 + 1);
 
             // 收款人必須是我自己（避免亂打）
             if (receiver != login_user) {
@@ -113,42 +130,21 @@ void listener_thread_fn(int port) {
                 return;
             }
 
-            // 把同一則訊息轉給「助教 server」去更新餘額
+            // 把訊息送給助教 server，不等待回覆（避免死鎖）
+            bool ok = false;
             {
                 lock_guard<mutex> lk(io_mtx);
-                if (!send_all(server_sock, msg)) {
-                    // 伺服器壞掉就回失敗
-                    (void)send_all(cs, "Transfer Failed!");
-                    close(cs);
-                    return;
-                }
+                ok = send_all(server_sock, msg);
             }
 
-            // 等待 server 回覆（通常會回 Transfer OK! 或更新後清單）
-            string svr_reply = recv_once(server_sock);
-
-            // 回覆 sender（只需要簡單 OK/Failed）
-            if (svr_reply.find("Transfer OK") != string::npos ||
-                svr_reply.find("OK") != string::npos) {
-                send_all(cs, "Transfer OK!");
-            } else {
-                send_all(cs, "Transfer Failed!");
-            }
-
-            // 在本端也印一下 server 的回覆，方便 demo
-            {
-                lock_guard<mutex> lk(io_mtx);
-                if (!svr_reply.empty()) {
-                    cout << "\n--- Server after transfer ---\n"
-                         << svr_reply
-                         << "-----------------------------\n";
-                }
-            }
+            if (ok) send_all(cs, "Transfer OK!");
+            else send_all(cs, "Transfer Failed!");
 
             close(cs);
         }).detach();
     }
 }
+
 
 // ------------------------ 主程式 ------------------------
 int main(int argc, char *argv[]) {
@@ -196,8 +192,8 @@ int main(int argc, char *argv[]) {
             if (usr.empty()) { cout << "名稱不可為空。\n"; continue; }
 
             string pkt = "REGISTER#" + usr;
-            if (!send_all(server_sock, pkt)) { cout << "傳送失敗。\n"; break; }
-            string r = recv_once(server_sock);
+            string r;
+            if (!talk_to_server(pkt, r)) { cout << "傳送失敗。\n"; break; }
             cout << "\n--- Server Response ---\n" << r << "------------------------\n";
 
             // 若成功註冊，暫存名稱（用於本機提示用；真正驗證還是看 server）
@@ -214,8 +210,8 @@ int main(int argc, char *argv[]) {
             // 先用「usr#0」探測帳號是否存在（不存在會回 220 AUTH_FAIL）
             {
                 string probe = usr + "#0";
-                if (!send_all(server_sock, probe)) { cout << "傳送失敗。\n"; break; }
-                string r = recv_once(server_sock);
+                string r;
+                if (!talk_to_server(probe, r)) { cout << "傳送失敗。\n"; break; }
                 if (r.find("220 AUTH_FAIL") != string::npos) {
                     cout << "登入失敗：該帳號尚未註冊。\n";
                     continue;
@@ -231,8 +227,8 @@ int main(int argc, char *argv[]) {
             // 傳送正式登入
             {
                 string pkt = usr + "#" + to_string(p);
-                if (!send_all(server_sock, pkt)) { cout << "傳送失敗。\n"; break; }
-                string r = recv_once(server_sock);
+                string r;
+                if (!talk_to_server(pkt, r)) { cout << "傳送失敗。\n"; break; }
                 cout << "\n--- Server Response ---\n" << r << "------------------------\n";
                 if (r.find("220 AUTH_FAIL") != string::npos) {
                     cout << "登入失敗：驗證錯誤。\n";
@@ -254,56 +250,79 @@ int main(int argc, char *argv[]) {
         else if (choice == 3) {
             // LIST
             if (!logged_in) { cout << "Please login first\n"; continue; }
-            if (!send_all(server_sock, "List")) { cout << "傳送失敗。\n"; break; }
-            string r = recv_once(server_sock);
+            string r;
+            if (!talk_to_server("List", r)) { cout << "傳送失敗。\n"; break; }
             cout << "\n--- Server Response ---\n" << r << "------------------------\n";
         }
         else if (choice == 4) {
-            // TRANSFER：格式 A#amount#B
             if (!logged_in) { cout << "Please login first\n"; continue; }
-
+        
             cout << "輸入轉帳格式 (A#amount#B): ";
             string line; getline(cin, line); line = trim(line);
+        
             size_t h1 = line.find('#'), h2 = line.find('#', h1 + 1);
             if (h1 == string::npos || h2 == string::npos) { cout << "格式錯誤，例：AA#1000#BB\n"; continue; }
-            string sender = line.substr(0, h1);
-            string amount = line.substr(h1 + 1, h2 - h1 - 1);
-            string payee  = line.substr(h2 + 1);
-
+        
+            string sender   = trim(line.substr(0, h1));
+            string amount   = trim(line.substr(h1 + 1, h2 - h1 - 1));
+            string receiver = trim(line.substr(h2 + 1));
+        
             if (sender != login_user) { cout << "Sender 必須是目前登入的使用者。\n"; continue; }
-
-            // 先向 server 取最新名單
-            if (!send_all(server_sock, "List")) { cout << "傳送失敗。\n"; break; }
-            string lst = recv_once(server_sock);
-
-            // 從名單找出 payee 的 IP 與 port
+            try { if (stod(amount) <= 0) { cout << "金額必須大於 0。\n"; continue; } } catch (...) { cout << "金額必須是數字。\n"; continue; }
+        
+            // 先向 server 要名單，找出 B 的 IP/Port
+            string list_before;
+            {
+                lock_guard<mutex> lk(io_mtx);
+                if (!send_all(server_sock, "List")) { cout << "傳送失敗。\n"; break; }
+                list_before = recv_once(server_sock);
+            }
+            cout << "Auto renew list from tracker before transfer...\n"
+                 << list_before << "---------------------\n";
+        
             string ip, port;
-            if (!find_user_in_list(lst, payee, ip, port)) {
-                cout << "找不到收款人或對方不在線上。\n";
-                continue;
+            if (!find_user_in_list(list_before, receiver, ip, port)) {
+                cout << "找不到收款人或對方不在線上。\n"; continue;
             }
-
-            // 連線到 payee，送出 "<A>#<amount>#<B>"
+        
+            int port_num;
+            try { port_num = stoi(trim(port)); } catch (...) { cout << "收款人 port 非法：" << port << "\n"; continue; }
+        
+            // A 直接連到 B（P2P）
             int ps = socket(AF_INET, SOCK_STREAM, 0);
-            sockaddr_in paddr{}; paddr.sin_family = AF_INET; paddr.sin_port = htons(stoi(port));
-            inet_pton(AF_INET, ip.c_str(), &paddr.sin_addr);
-            if (connect(ps, (sockaddr *)&paddr, sizeof(paddr)) < 0) {
-                cout << "無法連接到收款人。\n"; close(ps); continue;
+            sockaddr_in paddr{}; paddr.sin_family = AF_INET; paddr.sin_port = htons(port_num);
+            if (inet_pton(AF_INET, ip.c_str(), &paddr.sin_addr) <= 0 || connect(ps, (sockaddr*)&paddr, sizeof(paddr)) < 0) {
+                cout << "無法連接到收款人 " << receiver << " (" << ip << ":" << port_num << ")\n"; close(ps); continue;
             }
-
-            string tx = sender + "#" + amount + "#" + payee;
-            if (!send_all(ps, tx)) { cout << "傳送失敗。\n"; close(ps); continue; }
-
-            string ack = recv_once(ps); // 期待 "Transfer OK!" 或 "Transfer Failed!"
+        
+            if (!send_all(ps, line)) { cout << "傳送失敗。\n"; close(ps); continue; }
+            string ack = recv_once(ps);  // 期待 "Transfer OK!" or "Transfer Failed!"
             close(ps);
-
-            cout << "收款方回覆：" << ack << "\n";
+        
+            if (ack.find("Transfer OK") != string::npos) {
+                cout << "Transfer OK!\n";
+                // 成功後再向 server 拉一次最新清單
+                string list_after;
+                {
+                    lock_guard<mutex> lk(io_mtx);
+                    send_all(server_sock, "List");
+                    list_after = recv_once(server_sock);
+                }
+                cout << "auto renew list from tracker after transfer...\n"
+                     << list_after << "---------------------\n";
+            } else {
+                cout << "Transfer Failed!\n";
+            }
+        
+            cout << "(按 Enter 回選單)"; cin.get();
+            continue;
         }
+        
+                       
         else if (choice == 5) {
             // EXIT
-            send_all(server_sock, "Exit");
-            string r = recv_once(server_sock);
-            if (!r.empty()) {
+            string r;
+            if (talk_to_server("Exit", r) && !r.empty()) {
                 cout << "\n--- Server Response ---\n" << r << "------------------------\n";
             }
             cout << "Bye\n";
