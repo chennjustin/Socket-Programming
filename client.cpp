@@ -20,7 +20,6 @@ bool logged_in = false;
 bool listener_started = false; // 確保監聽只啟動一次
 mutex io_mtx;                  // 印出與 server_sock 保護
 
-// ------------------------ 工具函式 ------------------------
 bool send_all(int fd, const string &data) {
     size_t sent_total = 0;
     while (sent_total < data.size()) {
@@ -87,8 +86,6 @@ bool find_user_in_list(const string &list, const string &user, string &ip, strin
 }
 
 // ------------------------ P2P 收款監聽 ------------------------
-// 注意：不要在這個 thread 裡印「正在監聽…」；由主線在登入成功後印一次即可。
-// ------------------------ P2P 收款監聽 ------------------------
 void listener_thread_fn(int port) {
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     if (ls < 0) return;
@@ -112,7 +109,7 @@ void listener_thread_fn(int port) {
 
         // 每筆轉帳開一個獨立執行緒
         thread([cs]() {
-            string msg = recv_once(cs);         // 期待格式：A#amount#B
+            string msg = recv_once(cs);         // 格式：A#amount#B
             if (msg.empty()) { close(cs); return; }
 
             size_t h1 = msg.find('#');
@@ -123,14 +120,14 @@ void listener_thread_fn(int port) {
             string amount_str = msg.substr(h1 + 1, h2 - h1 - 1);
             string receiver = msg.substr(h2 + 1);
 
-            // 收款人必須是我自己（避免亂打）
+            // 收款人必須是我自己
             if (receiver != login_user) {
                 send_all(cs, "Transfer Failed!");
                 close(cs);
                 return;
             }
 
-            // 把訊息送給助教 server，不等待回覆（避免死鎖）
+            // 把訊息送給助教 server
             bool ok = false;
             {
                 lock_guard<mutex> lk(io_mtx);
@@ -146,7 +143,6 @@ void listener_thread_fn(int port) {
 }
 
 
-// ------------------------ 主程式 ------------------------
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         cerr << "Usage: ./client <ServerIP> <ServerPort>\n";
@@ -196,9 +192,8 @@ int main(int argc, char *argv[]) {
             if (!talk_to_server(pkt, r)) { cout << "傳送失敗。\n"; break; }
             cout << "\n--- Server Response ---\n" << r << "------------------------\n";
 
-            // 若成功註冊，暫存名稱（用於本機提示用；真正驗證還是看 server）
             if (r.find("100 OK") != string::npos) {
-                login_user.clear(); // 只是註冊，不代表已登入
+                login_user.clear();
             }
         }
         else if (choice == 2) {
@@ -236,7 +231,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // 登入成功 → 設定狀態並啟動監聽（只印一次提示，避免你遇到的「尾端才出現」）
+            // 登入成功 → 設定狀態並啟動監聽
             login_user = usr;
             listen_port = p;
             logged_in = true;
@@ -248,7 +243,6 @@ int main(int argc, char *argv[]) {
             cout << "已登入，監聽埠 " << listen_port << " 已啟動。\n";
         }
         else if (choice == 3) {
-            // LIST
             if (!logged_in) { cout << "Please login first\n"; continue; }
             string r;
             if (!talk_to_server("List", r)) { cout << "傳送失敗。\n"; break; }
@@ -296,7 +290,7 @@ int main(int argc, char *argv[]) {
             }
         
             if (!send_all(ps, line)) { cout << "傳送失敗。\n"; close(ps); continue; }
-            string ack = recv_once(ps);  // 期待 "Transfer OK!" or "Transfer Failed!"
+            string ack = recv_once(ps);  // "Transfer OK!" or "Transfer Failed!"
             close(ps);
         
             if (ack.find("Transfer OK") != string::npos) {
