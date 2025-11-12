@@ -142,6 +142,38 @@ void listener_thread_fn(int port) {
     }
 }
 
+int connect_p2p(const string& ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    // 嘗試連 Server 提供的 IP
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) == 1) {
+        timeval timeout{};
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        if (connect(fd, (sockaddr*)&addr, sizeof(addr)) == 0)
+            return fd; // 成功連線
+    }
+    close(fd);
+
+    // fallback: 嘗試連 localhost（支援 demo 在同機測試）
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(fd, (sockaddr*)&addr, sizeof(addr)) == 0)
+        return fd;
+
+    close(fd);
+    return -1;
+}
+
+
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -283,10 +315,10 @@ int main(int argc, char *argv[]) {
             try { port_num = stoi(trim(port)); } catch (...) { cout << "收款人 port 非法：" << port << "\n"; continue; }
         
             // A 直接連到 B（P2P）
-            int ps = socket(AF_INET, SOCK_STREAM, 0);
-            sockaddr_in paddr{}; paddr.sin_family = AF_INET; paddr.sin_port = htons(port_num);
-            if (inet_pton(AF_INET, ip.c_str(), &paddr.sin_addr) <= 0 || connect(ps, (sockaddr*)&paddr, sizeof(paddr)) < 0) {
-                cout << "無法連接到收款人 " << receiver << " (" << ip << ":" << port_num << ")\n"; close(ps); continue;
+            int ps = connect_p2p(ip, port_num);
+            if (ps < 0) {
+                cout << "無法連接到收款人 " << receiver << " (" << ip << ":" << port_num << ")\n";
+                continue;
             }
         
             if (!send_all(ps, line)) { cout << "傳送失敗。\n"; close(ps); continue; }
