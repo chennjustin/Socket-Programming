@@ -1,13 +1,14 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -pthread
+CFLAGS = -Wall -O2
+LIBS = -lssl -lcrypto -lpthread
 
-TARGET = server
-SRC = server.c
+all: server client
 
-all: $(TARGET)
+server: server.c
+	$(CC) $(CFLAGS) server.c -o server $(LIBS)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
+client: client.c
+	$(CC) $(CFLAGS) client.c -o client $(LIBS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f server client
